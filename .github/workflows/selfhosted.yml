@@ -114,6 +114,9 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
     steps:
+    - name: Cleanup
+      run: rm -rf * # This cleans github actions workspace
+
       # Create a project folder
     - name: Create Project Folders
       run: |
@@ -129,26 +132,35 @@ jobs:
         case "${{ github.event.inputs.BASE_PROJECT }}" in
         "ArrowOS 13.1")
           export PROJECTFOLDER="/crave-devspaces/Arrow13"
+          export PROJECTID="73"
         ;;
         "DerpFest 13.0")
           export PROJECTFOLDER="/crave-devspaces/DerpFest13"
+          export PROJECTID="64"
         ;;
         "LineageOS 21.0")
           export PROJECTFOLDER="/crave-devspaces/Lineage21"
+          export PROJECTID="72"
         ;;
         "LineageOS 20.0")
           export PROJECTFOLDER="/crave-devspaces/Lineage20"
+          export PROJECTID="36"
         ;;
         "CipherOS 14")
           export PROJECTFOLDER="/crave-devspaces/Cipher14"
+          export PROJECTID="79"
         ;;
         esac
-        if [ -d "$PROJECTFOLDER" ]; then
-          echo "$PROJECTFOLDER directory exists, skipping..."
-        else
-          mkdir $PROJECTFOLDER
+        if grep -q "$PROJECTFOLDER" <(crave clone list --json | jq -r '.clones[]."Cloned At"') && [ "${DCDEVSPACE}" == "1" ]; then
+          crave clone destroy -y $PROJECTFOLDER || echo "Error removing $PROJECTFOLDER"
+          crave clone create --projectID $PROJECTID $PROJECTFOLDER || echo "Crave clone create failed!"
+        else          
+        rm -rf $PROJECTFOLDER || true
+        mkdir $PROJECTFOLDER
         fi
         echo "PROJECTFOLDER=$PROJECTFOLDER" >> "$GITHUB_ENV"
+        echo "PROJECTID=$PROJECTID"  >> "$GITHUB_ENV"
+        echo "OLDDIR=$(pwd)" >> "$GITHUB_ENV"
         
       # Check-out in order to access the repository's files.
     - name: Check-out to repository
@@ -190,8 +202,8 @@ jobs:
 
       # Test Your Personal 'Local Manifests' against The ROM
     - name: Test Local Manifests
+      if: ${{ github.event.inputs.BUILD_DIFFERENT_ROM != 'skip' }}
       run: |
-        cd $PROJECTFOLDER
         rm -rf tester
         mkdir tester
         cd tester 
@@ -225,6 +237,7 @@ jobs:
               fi \
     
               timeout 1m repo sync --force-sync || { exit_code=$?; [ $exit_code -eq 124 ] || (echo "Error: Process failed with exit code $exit_code"; exit $exit_code); }
+              du -csh .
               rm -rf .repo
       timeout-minutes: 10  
       
@@ -234,7 +247,6 @@ jobs:
         mkdir -p $PROJECTFOLDER/.repo/manifests
         if [ "${DCDEVSPACE}" == "1" ]; then
         echo 'No need to set up crave, we are already running in devspace!'
-        cp crave.yaml $PROJECTFOLDER/.repo/manifests
         else
           curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
           mv ${PWD}/crave ${HOME}/bin/
@@ -242,7 +254,14 @@ jobs:
           envsubst < ${PWD}/crave.conf.sample >> ${PWD}/crave.conf
           rm -rf ${PWD}/crave.conf.sample       
           cp crave.conf $PROJECTFOLDER 
+        fi
+        if [[ -z "${{ secrets.CUSTOM_YAML }}" ]]; then
           cp crave.yaml $PROJECTFOLDER/.repo/manifests
+          echo "No Custom Configuration Found, Using Template!"
+        else
+          touch $PROJECTFOLDER/.repo/manifests/crave.yaml || true
+          echo "${{ secrets.CUSTOM_YAML }}" > $PROJECTFOLDER/.repo/manifests/crave.yaml
+          echo "Custom Configuration Found!"
         fi
       env:
         CRAVE_USERNAME: ${{  secrets.CRAVE_USERNAME  }}
@@ -267,7 +286,7 @@ jobs:
           ;;
           "LineageOS 20.0")
             repo init -u https://github.com/accupara/los20.git -b lineage-20.0 --git-lfs --depth=1
-            export BUILD_DIFFERENT_ROM="repo init -u https://github.com/accupara/los20.git -b lineage-20.0 --git-lfs --depth=1"
+            export BUILD_DIFFERENT_ROM="repo init -u https://github.com/LineageOS/android.git -b lineage-20.0 --git-lfs --depth=1"
           ;;
           "CipherOS 14")
             repo init -u https://github.com/CipherOS/android_manifest.git -b fourteen --git-lfs --depth=1
@@ -284,6 +303,7 @@ jobs:
 
       # Create a 'crave' job for building.
     - name: Start compilation through 'crave'
+      if: ${{ github.event.inputs.BUILD_DIFFERENT_ROM != 'skip' }}
       run: |
         cd $PROJECTFOLDER
         
@@ -310,6 +330,9 @@ jobs:
         export BUILD_HOSTNAME=crave ; \
         source build/envsetup.sh && \
 
+        echo "Repository: ${{ github.repository }}"; \
+        echo "Run ID: ${{ github.run_id }}"; \
+
         # Build the ROM
         lunch ${{ github.event.inputs.PRODUCT_NAME }}-${{ github.event.inputs.BUILD_TYPE }} && \
         make installclean && \
@@ -323,36 +346,39 @@ jobs:
         cd $PROJECTFOLDER
         crave stop --all
 
-      # Pull '.zip's and '.img's from 'crave'.
-    - name: Retrive build artifact(s)
-      run: |
-        crave ssh -- sleep 1
-        cd $PROJECTFOLDER
-        crave pull out/target/product/*/*.zip
-        crave pull out/target/product/*/*.img
-
-      # Directly upload to releases.
-    - name: Upload to repository's releases page
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          ${{ env.PROJECTFOLDER }}/${{ github.event.inputs.DEVICE_NAME }}/recovery.img
-          ${{ env.PROJECTFOLDER }}/${{ github.event.inputs.DEVICE_NAME }}/boot.img
-          ${{ env.PROJECTFOLDER }}/${{ github.event.inputs.DEVICE_NAME }}/vendor_boot.img
-          ${{ env.PROJECTFOLDER }}/${{ github.event.inputs.DEVICE_NAME }}/vendor.img
-          ${{ env.PROJECTFOLDER }}/${{ github.event.inputs.DEVICE_NAME }}/system.img
-          ${{ env.PROJECTFOLDER }}/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-        name: ${{ github.event.inputs.PRODUCT_NAME }}-${{ github.run_id }}
-        tag_name: ${{ github.run_id }}
-        body: |
-          Target: ${{ github.event.inputs.PRODUCT_NAME }}-${{ github.event.inputs.BUILD_TYPE }}
+      # Upload '.zip's and '.img's directly from 'crave' ssh.
+    - name: Upload build artifact(s)
       continue-on-error: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd $PROJECTFOLDER
+        echo "${{ secrets.GITHUB_TOKEN }}" > token.txt
+        crave push token.txt -d $(crave ssh -- pwd | grep -v Select | sed -s 's/\r//g')/
+        crave ssh -- "bash /opt/crave/github-actions/upload.sh '${{ github.run_id }}' '${{ github.event.inputs.DEVICE_NAME }}'  '${{ github.repository }}' '${{ github.event.inputs.PRODUCT_NAME }}-${{ github.run_id }}'"
+
+      # Pull Errors and Display them
+    - name: Display error.log
+      if: ${{ failure() }}
+      id: errorlog
+      run: |
+        cd $PROJECTFOLDER
+        crave ssh -- sleep 1
+        crave pull out/error.log
+        echo "Displaying out/error.log"
+        cat out/error.log
 
       # Upload to Telegram
     - name: Upload Using telegram-upload
       run: |
-        cd $$PROJECTFOLDER
-        telegram-upload ${{ github.event.inputs.DEVICE_NAME }}/recovery.img ${{ github.event.inputs.DEVICE_NAME }}/boot.img ${{ github.event.inputs.DEVICE_NAME }}/vendor_boot.img ${{ github.event.inputs.DEVICE_NAME }}/vendor.img ${{ github.event.inputs.DEVICE_NAME }}/system.img ${{ github.event.inputs.DEVICE_NAME }}/*.zip
+        cd $PROJECTFOLDER
+        crave push ~/.config/telegram-upload.json ~/.config/telegram-upload.session -d /home/admin/.config
+        crave ssh -- "sudo pip3 install -U telegram-upload; telegram-upload out/target/product/*/*.zip out/target/product/*/*.img"
       continue-on-error: true
+
+      # Remove 'crave' clone
+    - name: Destroy Crave Clone
+      run: |
+        if grep -q "$PROJECTFOLDER" <(crave clone list --json | jq -r '.clones[]."Cloned At"') && [ "${DCDEVSPACE}" == "1" ]; then
+          crave clone destroy -y $PROJECTFOLDER || echo "Error removing $PROJECTFOLDER"
+        else          
+          rm -rf $PROJECTFOLDER || true
+        fi
