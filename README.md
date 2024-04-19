@@ -76,7 +76,14 @@ LOS 20:
 LOS 21:
   ignoreClientHostname: true
 ```
+
 For more info, read the documentation [here](https://foss.crave.io/docs/crave-usage/#location-of-the-craveyaml-file)
+### EXTRA_FILES (Optional)
+If this exists, these files will be uploaded too. Remember to use relative path like out/target/product/devicename/file.something and seperate multiple files with spaces.
+### TELEGRAM_TOKEN (Optional)
+Bot token for telegram notifications
+### TELEGRAM_TO (Optional)
+Chat id for telegram notifications
 ## Inputs Explanation
 ### Base Project
     - These are the projects everyone can build, with a foss.crave.io account
